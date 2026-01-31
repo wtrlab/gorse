@@ -972,7 +972,12 @@ func (d *SQLDatabase) GetUserFeedback(ctx context.Context, userId string, endTim
 		for _, feedbackType := range feedbackTypes {
 			db = FeedbackTypeExpressionToSQL(db, feedbackType)
 		}
-		tx.Where(db)
+		if d.driver == ClickHouse {
+			// For ClickHouse, value is aggregated with sum(), so conditions on value must use HAVING
+			tx.Having(db)
+		} else {
+			tx.Where(db)
+		}
 	}
 	result, err := tx.Rows()
 	if err != nil {
@@ -1224,22 +1229,54 @@ func (d *SQLDatabase) GetFeedbackStream(ctx context.Context, batchSize int, scan
 	go func() {
 		defer close(feedbackChan)
 		defer close(errChan)
+
+		// Check if any feedback type expression has a value condition
+		hasValueCondition := false
+		for _, feedbackType := range scan.FeedbackTypes {
+			if feedbackType.ExprType != expression.None {
+				hasValueCondition = true
+				break
+			}
+		}
+
 		// send query
-		tx := d.gormDB.WithContext(ctx).
-			Table(d.FeedbackTable()).
-			Select("feedback_type, user_id, item_id, value, time_stamp, updated, comment")
+		var tx *gorm.DB
+		if d.driver == ClickHouse && hasValueCondition {
+			// For ClickHouse with value conditions, use the aggregated UserFeedbackTable
+			tx = d.gormDB.WithContext(ctx).
+				Table(d.UserFeedbackTable()).
+				Select("feedback_type, user_id, item_id, sum(value) AS value, min(time_stamp) AS time_stamp, max(updated) AS updated, anyLast(comment) AS comment").
+				Group("feedback_type, user_id, item_id")
+		} else {
+			tx = d.gormDB.WithContext(ctx).
+				Table(d.FeedbackTable()).
+				Select("feedback_type, user_id, item_id, value, time_stamp, updated, comment")
+		}
 		if len(scan.FeedbackTypes) > 0 {
 			db := d.gormDB
 			for _, feedbackType := range scan.FeedbackTypes {
 				db = FeedbackTypeExpressionToSQL(db, feedbackType)
 			}
-			tx.Where(db)
+			if d.driver == ClickHouse && hasValueCondition {
+				// For ClickHouse with aggregated values, use HAVING
+				tx.Having(db)
+			} else {
+				tx.Where(db)
+			}
 		}
 		if scan.BeginTime != nil {
-			tx.Where("time_stamp >= ?", d.convertTimeZone(scan.BeginTime))
+			if d.driver == ClickHouse && hasValueCondition {
+				tx.Having("time_stamp >= ?", d.convertTimeZone(scan.BeginTime))
+			} else {
+				tx.Where("time_stamp >= ?", d.convertTimeZone(scan.BeginTime))
+			}
 		}
 		if scan.EndTime != nil {
-			tx.Where("time_stamp <= ?", d.convertTimeZone(scan.EndTime))
+			if d.driver == ClickHouse && hasValueCondition {
+				tx.Having("time_stamp <= ?", d.convertTimeZone(scan.EndTime))
+			} else {
+				tx.Where("time_stamp <= ?", d.convertTimeZone(scan.EndTime))
+			}
 		}
 		if scan.BeginUserId != nil {
 			tx.Where("user_id >= ?", scan.BeginUserId)
