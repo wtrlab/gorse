@@ -55,25 +55,56 @@ type Recommender struct {
 type RecommenderFunc func(ctx context.Context) ([]cache.Score, string, error)
 
 func NewRecommender(config config.RecommendConfig, cacheClient cache.Database, dataClient data.Database, online bool, userId string, categories []string) (*Recommender, error) {
-	// Load user feedback
-	userFeedback, err := dataClient.GetUserFeedback(context.Background(), userId, new(time.Now()))
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
+	var userFeedback []data.Feedback
 	excludeSet := mapset.NewSet[string]()
 	coldstart := true
-	for _, feedback := range userFeedback {
-		// Negative feedback items should always be excluded (highest priority)
-		if expression.MatchFeedbackTypeExpressions(config.DataSource.NegativeFeedbackTypes, feedback.FeedbackType, feedback.Value) {
-			excludeSet.Add(feedback.ItemId)
-		} else if !config.Replacement.EnableReplacement || !online {
-			// Other feedback items are excluded unless replacement is enabled
-			excludeSet.Add(feedback.ItemId)
+
+	if online {
+		// Online path: optimize for latency.
+		// 1) Fast exclusion set: fetch only item IDs (single column, no deserialization overhead).
+		itemIds, err := dataClient.GetUserItemIds(context.Background(), userId, lo.ToPtr(time.Now()))
+		if err != nil {
+			return nil, errors.Trace(err)
 		}
-		if expression.MatchFeedbackTypeExpressions(config.DataSource.PositiveFeedbackTypes, feedback.FeedbackType, feedback.Value) {
-			coldstart = false
+		if !config.Replacement.EnableReplacement {
+			excludeSet = mapset.NewSet(itemIds...)
+		}
+		// 2) Limited feedback: fetch only recent feedback needed for item-to-item context.
+		userFeedback, err = dataClient.GetUserFeedback(context.Background(), userId, lo.ToPtr(time.Now()))
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		// Negative feedback items are always excluded (highest priority), even when
+		// replacement is enabled. Evaluated on the untrimmed feedback so older negative
+		// feedback is not lost by the context-size trimming below.
+		for _, feedback := range userFeedback {
+			if expression.MatchFeedbackTypeExpressions(config.DataSource.NegativeFeedbackTypes, feedback.FeedbackType, feedback.Value) {
+				excludeSet.Add(feedback.ItemId)
+			}
+			if expression.MatchFeedbackTypeExpressions(config.DataSource.PositiveFeedbackTypes, feedback.FeedbackType, feedback.Value) {
+				coldstart = false
+			}
+		}
+		// Sort latest-first and trim to ContextSize to bound the item-to-item loop.
+		data.SortFeedbacks(userFeedback)
+		if config.ContextSize > 0 && len(userFeedback) > config.ContextSize {
+			userFeedback = userFeedback[:config.ContextSize]
+		}
+	} else {
+		// Offline/worker path: load full history (latency is acceptable in batch jobs).
+		var err error
+		userFeedback, err = dataClient.GetUserFeedback(context.Background(), userId, lo.ToPtr(time.Now()))
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		for _, feedback := range userFeedback {
+			excludeSet.Add(feedback.ItemId)
+			if expression.MatchFeedbackTypeExpressions(config.DataSource.PositiveFeedbackTypes, feedback.FeedbackType, feedback.Value) {
+				coldstart = false
+			}
 		}
 	}
+
 	return &Recommender{
 		config:       config,
 		cacheClient:  cacheClient,
@@ -83,7 +114,7 @@ func NewRecommender(config config.RecommendConfig, cacheClient cache.Database, d
 		online:       online,
 		coldstart:    coldstart,
 		categories:   categories,
-		excludeSet:   excludeSet,
+			excludeSet:   excludeSet,
 	}, nil
 }
 
@@ -299,17 +330,16 @@ func (r *Recommender) recommendUserToUser(name string) RecommenderFunc {
 		if err != nil {
 			return nil, "", errors.Trace(err)
 		}
-		// aggregate scores
+		// aggregate scores — use GetUserItemIds instead of full GetUserFeedback
+		// to avoid the N+1 query problem (one DB call per similar user).
 		for _, user := range similarUsers {
-			// load historical feedback
-			feedbacks, err := r.dataClient.GetUserFeedback(ctx, user.Id, new(time.Now()), r.config.DataSource.PositiveFeedbackTypes...)
+			itemIds, err := r.dataClient.GetUserItemIds(ctx, user.Id, lo.ToPtr(time.Now()))
 			if err != nil {
 				return nil, "", errors.Trace(err)
 			}
-			// add unseen items
-			for _, feedback := range feedbacks {
-				if !r.excludeSet.Contains(feedback.ItemId) {
-					scores[feedback.ItemId] += user.Score
+			for _, itemId := range itemIds {
+				if !r.excludeSet.Contains(itemId) {
+					scores[itemId] += user.Score
 				}
 			}
 		}
