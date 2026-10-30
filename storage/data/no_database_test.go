@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gorse-io/gorse/config"
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 )
 

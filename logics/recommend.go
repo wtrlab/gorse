@@ -114,7 +114,7 @@ func NewRecommender(config config.RecommendConfig, cacheClient cache.Database, d
 		online:       online,
 		coldstart:    coldstart,
 		categories:   categories,
-			excludeSet:   excludeSet,
+		excludeSet:   excludeSet,
 	}, nil
 }
 
