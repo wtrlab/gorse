@@ -1797,10 +1797,21 @@ func (d *SQLDatabase) GetFeedbackStream(ctx context.Context, batchSize int, scan
 		// send query
 		var tx *gorm.DB
 		if d.driver == ClickHouse && hasValueCondition {
-			// For ClickHouse with value conditions, use the aggregated UserFeedbackTable
+			// For ClickHouse with value conditions, use the aggregated UserFeedbackTable.
+			// The TTL window is applied inside the aggregate so that `value` only counts
+			// reads inside the window, and `time_stamp` carries the LATEST read so a group
+			// survives the HAVING window filter when the user read it recently even if the
+			// first read was long ago (a group with no in-window read keeps its old
+			// max(time_stamp) and is filtered out).
+			selectSQL := "feedback_type, user_id, item_id, sum(value) AS value, max(time_stamp) AS time_stamp, max(updated) AS updated, anyLast(comment) AS comment"
+			var selectArgs []any
+			if scan.BeginTime != nil {
+				selectSQL = "feedback_type, user_id, item_id, sumIf(value, time_stamp >= ?) AS value, max(time_stamp) AS time_stamp, max(updated) AS updated, anyLast(comment) AS comment"
+				selectArgs = append(selectArgs, d.convertTimeZone(scan.BeginTime))
+			}
 			tx = d.gormDB.WithContext(ctx).
 				Table(d.UserFeedbackTable()).
-				Select("feedback_type, user_id, item_id, sum(value) AS value, min(time_stamp) AS time_stamp, max(updated) AS updated, anyLast(comment) AS comment").
+				Select(selectSQL, selectArgs...).
 				Group("feedback_type, user_id, item_id")
 		} else {
 			tx = d.gormDB.WithContext(ctx).
