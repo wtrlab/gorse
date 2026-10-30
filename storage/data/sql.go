@@ -1803,10 +1803,15 @@ func (d *SQLDatabase) GetFeedbackStream(ctx context.Context, batchSize int, scan
 			// survives the HAVING window filter when the user read it recently even if the
 			// first read was long ago (a group with no in-window read keeps its old
 			// max(time_stamp) and is filtered out).
+			// ClickHouse resolves SELECT aliases inside aggregate arguments, so an
+			// unqualified `time_stamp` in sumIf expands to the `max(time_stamp)` alias
+			// below and raises ILLEGAL_AGGREGATION (code 184). Qualifying it with the
+			// table name resolves to the real column instead.
+			userFeedbackTable := d.UserFeedbackTable()
 			selectSQL := "feedback_type, user_id, item_id, sum(value) AS value, max(time_stamp) AS time_stamp, max(updated) AS updated, anyLast(comment) AS comment"
 			var selectArgs []any
 			if scan.BeginTime != nil {
-				selectSQL = "feedback_type, user_id, item_id, sumIf(value, time_stamp >= ?) AS value, max(time_stamp) AS time_stamp, max(updated) AS updated, anyLast(comment) AS comment"
+				selectSQL = fmt.Sprintf("feedback_type, user_id, item_id, sumIf(value, %s.time_stamp >= ?) AS value, max(time_stamp) AS time_stamp, max(updated) AS updated, anyLast(comment) AS comment", userFeedbackTable)
 				selectArgs = append(selectArgs, d.convertTimeZone(scan.BeginTime))
 			}
 			tx = d.gormDB.WithContext(ctx).
