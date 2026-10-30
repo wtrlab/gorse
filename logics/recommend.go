@@ -85,11 +85,10 @@ func NewRecommender(config config.RecommendConfig, cacheClient cache.Database, d
 				coldstart = false
 			}
 		}
-		// Sort latest-first and trim to ContextSize to bound the item-to-item loop.
-		data.SortFeedbacks(userFeedback)
-		if config.ContextSize > 0 && len(userFeedback) > config.ContextSize {
-			userFeedback = userFeedback[:config.ContextSize]
-		}
+		// No pre-trim here on purpose: recommendItemToItem sorts and caps the context at
+		// ContextSize while collecting *positive* feedback (upstream 6f2bb84 / #1231).
+		// Trimming the whole history first let shallow read<5 events consume the context
+		// slots, collapsing the item-to-item context for heavy readers.
 	} else {
 		// Offline/worker path: load full history (latency is acceptable in batch jobs).
 		var err error
