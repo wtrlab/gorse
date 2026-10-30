@@ -924,6 +924,17 @@ func (s *RestServer) getRecommend(request *restful.Request, response *restful.Re
 		// the cooldown period are served instantly.
 		if cacheExpire > 0 && len(scores) > 0 {
 			now := time.Now()
+			// AddScores is a pure upsert, so without pruning this user's previous
+			// ranking stays in the per-user ZSET and a later SearchScores would mix
+			// stale runs into the result. The worker's stale-row prune never runs in
+			// this deployment (collaborative=none + ranker=none short-circuit), so the
+			// server has to clear the previous ranking itself.
+			if err := s.CacheClient.DeleteScores(ctx, []string{cache.Recommend}, cache.ScoreCondition{
+				Before: &now,
+				Subset: new(userId),
+			}); err != nil {
+				log.Logger().Error("failed to clear stale on-demand recommendation", zap.Error(err))
+			}
 			cached := make([]cache.Score, len(scores))
 			copy(cached, scores)
 			for i := range cached {
