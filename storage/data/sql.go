@@ -1798,25 +1798,15 @@ func (d *SQLDatabase) GetFeedbackStream(ctx context.Context, batchSize int, scan
 		var tx *gorm.DB
 		if d.driver == ClickHouse && hasValueCondition {
 			// For ClickHouse with value conditions, use the aggregated UserFeedbackTable.
-			// The TTL window is applied inside the aggregate so that `value` only counts
-			// reads inside the window, and `time_stamp` carries the LATEST read so a group
-			// survives the HAVING window filter when the user read it recently even if the
-			// first read was long ago (a group with no in-window read keeps its old
-			// max(time_stamp) and is filtered out).
-			// ClickHouse resolves SELECT aliases inside aggregate arguments, so an
-			// unqualified `time_stamp` in sumIf expands to the `max(time_stamp)` alias
-			// below and raises ILLEGAL_AGGREGATION (code 184). Qualifying it with the
-			// table name resolves to the real column instead.
-			userFeedbackTable := d.UserFeedbackTable()
-			selectSQL := "feedback_type, user_id, item_id, sum(value) AS value, max(time_stamp) AS time_stamp, max(updated) AS updated, anyLast(comment) AS comment"
-			var selectArgs []any
-			if scan.BeginTime != nil {
-				selectSQL = fmt.Sprintf("feedback_type, user_id, item_id, sumIf(value, %s.time_stamp >= ?) AS value, max(time_stamp) AS time_stamp, max(updated) AS updated, anyLast(comment) AS comment", userFeedbackTable)
-				selectArgs = append(selectArgs, d.convertTimeZone(scan.BeginTime))
-			}
+			// `time_stamp` in that table is SimpleAggregateFunction(min, ...) — the FIRST
+			// touch of a (user,item,type) group — and the group is a single merged row, so
+			// it cannot express "was read inside the window". The table is bounded by a
+			// 90-day TTL (see gorse-cluster.yaml), so sum(value) already covers the
+			// retained window, and the window filter below is applied to `updated`
+			// (last activity) instead of `time_stamp`.
 			tx = d.gormDB.WithContext(ctx).
 				Table(d.UserFeedbackTable()).
-				Select(selectSQL, selectArgs...).
+				Select("feedback_type, user_id, item_id, sum(value) AS value, min(time_stamp) AS time_stamp, max(updated) AS updated, anyLast(comment) AS comment").
 				Group("feedback_type, user_id, item_id")
 		} else {
 			tx = d.gormDB.WithContext(ctx).
@@ -1837,14 +1827,16 @@ func (d *SQLDatabase) GetFeedbackStream(ctx context.Context, batchSize int, scan
 		}
 		if scan.BeginTime != nil {
 			if d.driver == ClickHouse && hasValueCondition {
-				tx.Having("time_stamp >= ?", d.convertTimeZone(scan.BeginTime))
+				// Window on last activity: the aggregated row's time_stamp is the first
+				// touch and cannot say whether the group was read inside the window.
+				tx.Having("updated >= ?", d.convertTimeZone(scan.BeginTime))
 			} else {
 				tx.Where("time_stamp >= ?", d.convertTimeZone(scan.BeginTime))
 			}
 		}
 		if scan.EndTime != nil {
 			if d.driver == ClickHouse && hasValueCondition {
-				tx.Having("time_stamp <= ?", d.convertTimeZone(scan.EndTime))
+				tx.Having("updated <= ?", d.convertTimeZone(scan.EndTime))
 			} else {
 				tx.Where("time_stamp <= ?", d.convertTimeZone(scan.EndTime))
 			}
